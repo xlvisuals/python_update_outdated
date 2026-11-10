@@ -17,11 +17,13 @@
 #     script's own generated output files (requirements_installed.txt,
 #     requirements_deptree.txt, requirements_toplevel.txt).
 #
-# Packages are not updated if:
-#   - They appear in constraints.txt or in any per-project constraints file
-#     (constraints_<project>.txt) with a version pin (e.g. "cbor2<=6.0"),
-#     in which case they are highlighted in yellow showing the constraint
-#     (and, for per-project constraints, the file it came from).
+# Constrained packages (listed in constraints.txt or any constraints_<project>.txt
+# with a version specifier, e.g. "cbor2<=6.0") are still upgraded, but only to
+# the newest release that satisfies EVERY constraint on them (and is old
+# enough). They are shown as "UPDATED (within <=6.0; latest X)". If no newer
+# allowed release exists they are highlighted in yellow as SKIPPED, showing the
+# constraint (and, for per-project constraints, the file it came from). They
+# are also skipped if the constraint cannot be evaluated (see below).
 #
 # Constraint files handled:
 #   - constraints.txt           (optional) - global; applies to every project
@@ -32,14 +34,30 @@
 #     When installing requirements_<project>.txt, pip gets constraints.txt
 #     plus constraints_<project>.txt (requirements.txt gets constraints.txt
 #     only). All projects share one environment, so when deciding what to
-#     upgrade a package is skipped if ANY constraint file constrains it.
+#     upgrade a package must satisfy ALL constraint files that mention it.
+#     A specifier that packaging cannot parse (e.g. "requests<abc") makes
+#     that package FAILED, never unconstrained; if the packaging library is
+#     unavailable, constrained packages are skipped rather than upgraded.
 #     A constraints file that is unreadable, or contains a line that cannot
 #     be parsed as "<package><operator><version>", aborts the run (before
 #     anything is installed) rather than being silently ignored. A
 #     constraints_<project>.txt without a matching requirements file is
 #     still applied to upgrade decisions, with a warning.
-#   - The new version was released less than MIN_AGE_DAYS days ago (default: 5),
+# Packages are also not updated to a version released less than MIN_AGE_DAYS
+# days ago (default: 5),
 #     to avoid freshly released packages that may be unstable or get yanked.
+#
+# Per-project versions: all projects share one environment, but every
+# requirements file is updated on its own. Each pinned line moves to the newest
+# release (old enough, see MIN_AGE_DAYS) that satisfies the constraints that
+# apply to THAT file (constraints.txt + its own constraints_<project>.txt), so
+# e.g. ternary can stay on wrapt 1.x while the other projects move to 2.x. If
+# the files end up on different versions of a package, nothing is installed
+# for it in the shared environment ("ENV UNCHANGED (files differ: ...)").
+# A >=, ~=, <=, ... line is only rewritten to the installed version if that
+# version satisfies the line and the file's constraints; otherwise it is left
+# alone (with a note) and handled by the per-file update, which stays inside
+# the line's own range.
 #
 # For packages that are updated, only the affected lines are modified in
 # whichever requirements file(s) actually pin that package — comments,
@@ -163,7 +181,19 @@ normalize_pkg() {
 # several files keeps all of them. Fails closed: an unreadable file or an
 # unparseable line aborts the run, so a typo can never silently turn into
 # "no constraint".
+#
+# CONSTRAINT_SPECS holds the same constraints as bare, comma-joined
+# specifiers (e.g. "<=6.0,!=5.9") with no file labels, in the form
+# packaging's SpecifierSet understands. A package constrained in several
+# files must satisfy all of them.
 declare -A CONSTRAINTS
+#
+# FILE_SPECS keeps the same bare specifiers per constraints FILE
+# (key: "<constraints file>|<normalized package name>"), so the constraints
+# that apply to one particular requirements file can be worked out later
+# (see applicable_spec).
+declare -A CONSTRAINT_SPECS
+declare -A FILE_SPECS
 parse_constraints_file() {
   local file="$1" label="" lineno=0 line clean pkg spec
   [ "$file" != "$CONSTRAINTS_FILE" ] && label=" ($file)"
@@ -188,6 +218,16 @@ parse_constraints_file() {
       CONSTRAINTS[$pkg]="${CONSTRAINTS[$pkg]}; ${spec}"
     else
       CONSTRAINTS[$pkg]="$spec"
+    fi
+    if [ -n "${CONSTRAINT_SPECS[$pkg]:-}" ]; then
+      CONSTRAINT_SPECS[$pkg]="${CONSTRAINT_SPECS[$pkg]},${BASH_REMATCH[2]}"
+    else
+      CONSTRAINT_SPECS[$pkg]="${BASH_REMATCH[2]}"
+    fi
+    if [ -n "${FILE_SPECS["$file|$pkg"]:-}" ]; then
+      FILE_SPECS["$file|$pkg"]="${FILE_SPECS["$file|$pkg"]},${BASH_REMATCH[2]}"
+    else
+      FILE_SPECS["$file|$pkg"]="${BASH_REMATCH[2]}"
     fi
   done < "$file"
 }
@@ -284,6 +324,55 @@ if [ "$PIP_VER" != "$PY_PIP_VER" ]; then
   ENV_WARNINGS+=("'pip' does not belong to the active python3 (pip: $PIP_VER; python3 -m pip: ${PY_PIP_VER:-unavailable}).")
 fi
 
+# Prints the comma-joined specifier that applies to package $2 (normalized
+# name) when it appears in requirements file $1: the global constraints.txt
+# plus the matching constraints_<project>.txt (requirements.txt gets
+# constraints.txt only). Prints nothing if the package is unconstrained
+# for that file.
+applicable_spec() {
+  local req="$1" pkg="$2" g="" p=""
+  [ -f "$CONSTRAINTS_FILE" ] && g="${FILE_SPECS["$CONSTRAINTS_FILE|$pkg"]:-}"
+  if [ "$req" != "$MAIN_REQUIREMENTS_FILE" ]; then
+    p="${FILE_SPECS["constraints_${req#requirements_}|$pkg"]:-}"
+  fi
+  printf '%s' "$g${g:+${p:+,}}$p"
+}
+
+# version_satisfies VERSION SPEC: exit 0 if VERSION satisfies the
+# comma-joined specifier SPEC (an empty SPEC accepts anything). Fails
+# closed: an unparseable version or specifier, or a missing "packaging"
+# library, is exit 1.
+version_satisfies() {
+  python3 -c '
+import sys
+from packaging.version import Version
+from packaging.specifiers import SpecifierSet
+try:
+    ok = SpecifierSet(sys.argv[2]).contains(Version(sys.argv[1]), prereleases=True)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if ok else 1)
+' "$1" "$2" 2>/dev/null
+}
+
+# Progress output for the slow per-package steps. On a terminal a single
+# line is overwritten in place ("[12/87] requirements_yoe.txt: wrapt"); when
+# output is not a terminal (redirected to a file, cron) it is silent and
+# only a line per requirements file is printed instead, so logs stay clean.
+progress() {
+  [ -t 1 ] && printf '\r\033[K%s' "${1:0:78}"
+  return 0
+}
+progress_done() {
+  [ -t 1 ] && printf '\r\033[K'
+  return 0
+}
+# Number of pinned lines (name + operator + version) across all requirements
+# files, used as the denominator for progress.
+count_pins() {
+  cat "${REQUIREMENTS_FILES[@]}" | grep -cE '^[A-Za-z0-9_.-]+(==|>=|<=|~=|!=|>|<)' || true
+}
+
 echo ""
 echo "-----------------------------------------------------------------"
 echo "PIP UPDATE SCRIPT"
@@ -317,6 +406,9 @@ if [ "$DRY_RUN" = false ]; then
     pip install -r "$f" "${CONSTRAINTS_ARGS[@]}"
   done
 
+  # "packaging" is needed below to check pins against constraints.
+  python3 -c "import packaging.version" 2>/dev/null || pip install --quiet packaging
+
   # Normalize every requirements-file line so its package NAME matches
   # pip's canonical casing/spelling, and so every pin uses ==:
   #   - lines already pinned with == : casing is fixed if needed, the
@@ -332,7 +424,10 @@ if [ "$DRY_RUN" = false ]; then
   echo ""
   echo "Normalizing package pins..."
   INSTALLED_JSON=$(pip list --format=json)
+  norm_total=$(count_pins)
+  norm_i=0
   for f in "${REQUIREMENTS_FILES[@]}"; do
+    [ -t 1 ] || echo "  $f"
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
         \#*|'') continue ;;
@@ -340,6 +435,8 @@ if [ "$DRY_RUN" = false ]; then
       pkg=$(echo "$line" | sed -E 's/^([A-Za-z0-9_.-]+).*/\1/')
       op=$(echo "$line" | sed -nE 's/^[A-Za-z0-9_.-]+(==|>=|<=|~=|!=|>|<).*/\1/p')
       [ -z "$op" ] && continue
+      norm_i=$((norm_i + 1))
+      progress "[$norm_i/$norm_total] $f: $pkg"
       cur_ver=$(echo "$line" | sed -E "s/^[A-Za-z0-9_.-]+(==|>=|<=|~=|!=|>|<)([^[:space:]#]*).*/\\2/")
       pkg_norm=$(normalize_pkg "$pkg")
       result=$(echo "$INSTALLED_JSON" | jq -r --arg p "$pkg_norm" '.[] | select((.name | ascii_downcase | gsub("[-_.]+"; "-")) == $p) | "\(.name)\t\(.version)"')
@@ -352,10 +449,24 @@ if [ "$DRY_RUN" = false ]; then
         [ "$new_name" = "$pkg" ] && continue
         perl -i -pe "s/^(\\Q${pkg}\\E)(==)([^\\s#]*)(.*)\$/${new_name}==${cur_ver}\${4}/i" "$f"
       else
+        # Only rewrite to the installed version if that version actually
+        # satisfies the line itself and the constraints that apply to this
+        # file. The environment is shared, so the installed version may
+        # belong to another project (e.g. wrapt 2.x installed for one
+        # project while ternary needs 1.x); in that case the line is left
+        # alone rather than silently broken. Fails closed.
+        applicable=$(applicable_spec "$f" "$pkg_norm")
+        check_spec="${op}${cur_ver}${applicable:+,$applicable}"
+        if ! version_satisfies "$installed_ver" "$check_spec"; then
+          echo "Note: $f: left '$pkg$op$cur_ver' as-is (installed $installed_ver does not satisfy $check_spec)"
+          continue
+        fi
         perl -i -pe "s/^(\\Q${pkg}\\E)(==|>=|<=|~=|!=|>|<)([^\\s#]*)(.*)\$/${new_name}==${installed_ver}\${4}/i" "$f"
       fi
     done < "$f"
   done
+  progress_done
+  echo "Checked $norm_i pinned line(s)."
 fi
 
 # Ensure "packaging" is importable for PEP 440-aware version comparison
@@ -381,13 +492,28 @@ python3 -c "import packaging.version" 2>/dev/null || HAVE_PACKAGING=false
 # best_version/best_release_date are empty if no release is both newer
 # and old enough (i.e. every newer release is too new). latest_version
 # and latest_release_date are empty if the PyPI lookup itself failed.
+#
+# An optional 4th argument is a comma-joined constraint specifier
+# (e.g. "<=6.0,!=5.9"). When given, the chosen release must also satisfy
+# it, so a constrained package is upgraded to the newest allowed release
+# instead of being skipped. An invalid specifier is treated as a failed
+# lookup (all fields empty, reason on stderr), never as "no constraint".
 find_installable_version() {
-  local name="$1" curr="$2" min_age_days="$3"
-  python3 - "$name" "$curr" "$min_age_days" <<'PYEOF'
+  local name="$1" curr="$2" min_age_days="$3" spec="${4:-}"
+  python3 - "$name" "$curr" "$min_age_days" "$spec" <<'PYEOF'
 import sys, json, urllib.request, datetime
 from packaging.version import Version, InvalidVersion
+from packaging.specifiers import SpecifierSet, InvalidSpecifier
 
 name, curr, min_age_days = sys.argv[1], sys.argv[2], int(sys.argv[3])
+spec_str = sys.argv[4]
+
+try:
+    spec = SpecifierSet(spec_str)
+except InvalidSpecifier:
+    print(f"invalid constraint '{spec_str}' for {name}", file=sys.stderr)
+    print("\t\t\t")
+    sys.exit(0)
 
 try:
     req = urllib.request.Request(
@@ -438,7 +564,8 @@ if not releases:
 releases.sort(key=lambda r: r[0])
 latest_v, latest_ver_str, latest_date = releases[-1]
 
-candidates = [r for r in releases if r[0] > curr_v and r[2] <= cutoff]
+candidates = [r for r in releases
+              if r[0] > curr_v and r[2] <= cutoff and spec.contains(r[0])]
 if candidates:
     best_v, best_ver_str, best_date = max(candidates, key=lambda r: r[0])
     best_out = f"{best_ver_str}\t{best_date.date().isoformat()}"
@@ -449,6 +576,107 @@ print(f"{latest_ver_str}\t{latest_date.date().isoformat()}\t{best_out}")
 PYEOF
 }
 
+# -----------------------------------------------------------------------------
+# Per-file planning. All projects share one environment, but each
+# requirements file is updated on its own terms: for every pinned line the
+# newest release that is old enough and satisfies the constraints that apply
+# to THAT file (constraints.txt + its own constraints_<project>.txt) is
+# chosen, starting from the version pinned in that file. So ternary can stay
+# on wrapt 1.x while every other project moves to 2.x.
+# For non-== lines (>=, ~=, <=, ...) the line's own range is honoured too.
+# -----------------------------------------------------------------------------
+declare -A PKG_FILES PIN_NAME PIN_CURR PIN_TARGET PIN_TDATE PIN_FAILED FIND_CACHE ENV_FAILED
+PLAN_KEYS=()
+
+plan_file_updates() {
+  local f line pkg op cur_ver pkg_norm spec cache_key key res
+  local latest_v latest_d target target_d
+  if [ "$HAVE_PACKAGING" != true ]; then
+    echo "Note: 'packaging' is unavailable - per-file checks skipped, requirements files will not be patched"
+    return
+  fi
+  local plan_total plan_i=0
+  plan_total=$(count_pins)
+  for f in "${REQUIREMENTS_FILES[@]}"; do
+    [ -t 1 ] || echo "  $f"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        \#*|'') continue ;;
+      esac
+      op=$(echo "$line" | sed -nE 's/^[A-Za-z0-9_.-]+(==|>=|<=|~=|!=|>|<).*/\1/p')
+      [ -z "$op" ] && continue
+      pkg=$(echo "$line" | sed -E 's/^([A-Za-z0-9_.-]+).*/\1/')
+      plan_i=$((plan_i + 1))
+      progress "[$plan_i/$plan_total] $f: $pkg (querying PyPI)"
+      cur_ver=$(echo "$line" | sed -E "s/^[A-Za-z0-9_.-]+(==|>=|<=|~=|!=|>|<)([^[:space:]#]*).*/\\2/")
+      pkg_norm=$(normalize_pkg "$pkg")
+      spec=$(applicable_spec "$f" "$pkg_norm")
+      [ "$op" != "==" ] && spec="${op}${cur_ver}${spec:+,$spec}"
+      cache_key="$pkg_norm|$cur_ver|$spec"
+      if [ -z "${FIND_CACHE[$cache_key]+x}" ]; then
+        FIND_CACHE[$cache_key]=$(find_installable_version "$pkg" "$cur_ver" "$MIN_AGE_DAYS" "$spec")
+      fi
+      res="${FIND_CACHE[$cache_key]}"
+      IFS=$'\t' read -r latest_v latest_d target target_d <<< "$res"
+      key="$f|$pkg_norm"
+      PKG_FILES[$pkg_norm]="${PKG_FILES[$pkg_norm]:-} $f"
+      PIN_NAME[$key]="$pkg"
+      PIN_CURR[$key]="$cur_ver"
+      PIN_TARGET[$key]="$target"
+      PIN_TDATE[$key]="$target_d"
+      [ -z "$latest_v" ] && PIN_FAILED[$key]=1
+      PLAN_KEYS+=("$key")
+    done < "$f"
+  done
+  progress_done
+  echo "Checked $plan_i pinned line(s) against PyPI."
+}
+
+# Prints the distinct versions the requirements files that pin package $1
+# (normalized name) will have once the planned updates are applied.
+pkg_versions_after_update() {
+  local pkg_norm="$1" f key
+  for f in ${PKG_FILES[$pkg_norm]:-}; do
+    key="$f|$pkg_norm"
+    printf '%s\n' "${PIN_TARGET[$key]:-${PIN_CURR[$key]}}"
+  done | sort -u | tr '\n' ' '
+}
+
+# Applies (or, in --dry-run, only reports) the planned per-file updates.
+# A package whose install into the environment failed is not patched.
+FILE_UPDATED=0
+apply_file_updates() {
+  local key f pkg_norm name target new_name header_done=false
+  for key in "${PLAN_KEYS[@]}"; do
+    f="${key%%|*}"
+    pkg_norm="${key#*|}"
+    name="${PIN_NAME[$key]}"
+    target="${PIN_TARGET[$key]:-}"
+    if [ -n "${PIN_FAILED[$key]:-}" ]; then
+      [ "$header_done" = false ] && { echo ""; echo "Requirements file updates:"; header_done=true; }
+      printf "%-30s %-28s %-12s FAILED (PyPI lookup or constraint)\n" "$name" "$f" "${PIN_CURR[$key]}"
+      continue
+    fi
+    [ -z "$target" ] && continue
+    [ "$header_done" = false ] && { echo ""; echo "Requirements file updates:"; header_done=true; }
+    if [ -n "${ENV_FAILED[$pkg_norm]:-}" ]; then
+      printf "${YELLOW}%-30s${RESET} %-28s %-12s %-12s ${YELLOW}SKIPPED (install failed)${RESET}\n" "$name" "$f" "${PIN_CURR[$key]}" "$target"
+      continue
+    fi
+    if [ "$DRY_RUN" = false ]; then
+      new_name=$(display_name "$name")
+      perl -i -pe "s/^(\\Q${name}\\E)(==|>=|<=|~=|!=|>|<)([^\\s#]*)(.*)\$/${new_name}==${target}\${4}/i" "$f"
+    fi
+    printf "${GREEN}%-30s${RESET} %-28s %-12s ${GREEN}%-12s${RESET} %-12s\n" "$name" "$f" "${PIN_CURR[$key]}" "$target" "${PIN_TDATE[$key]}"
+    FILE_UPDATED=$((FILE_UPDATED + 1))
+  done
+  [ "$header_done" = true ] && echo "Requirements lines updated: $FILE_UPDATED"
+}
+
+echo ""
+echo "Checking requirements files..."
+plan_file_updates
+
 # Get outdated packages as JSON
 echo ""
 echo "Checking for outdated packages..."
@@ -457,6 +685,7 @@ COUNT=$(echo "$OUTDATED" | jq 'length')
 
 if [ "$COUNT" -eq 0 ]; then
   echo "All packages are up to date."
+  apply_file_updates
   exit 0
 fi
 
@@ -468,6 +697,7 @@ echo "-------------------------------------------------------------------------"
 UPDATED=0
 SKIPPED=0
 TOO_NEW=0
+ENV_LEFT=0
 
 # Today's date as epoch seconds
 TODAY_EPOCH=$(date +%s)
@@ -480,11 +710,26 @@ while IFS= read -r row; do
   latest=$(echo "$row" | jq -r '.latest_version')
   pkg_lower=$(normalize_pkg "$name")
 
-  # Check constraints
+  # Constrained packages are still upgraded, but only to the newest
+  # release that satisfies every constraint (see find_installable_version).
+  # Fails closed: if the constraint can't be evaluated (no packaging
+  # library, or no bare specifier recorded), the package is skipped.
   constraint=${CONSTRAINTS[$pkg_lower]:-}
-  if [ -n "$constraint" ]; then
-    printf "${YELLOW}%-30s${RESET} %-12s %-12s %-12s ${YELLOW}SKIPPED (constrained: %s)${RESET}\n" "$name" "$curr" "$latest" "-" "$constraint"
+  constraint_spec=${CONSTRAINT_SPECS[$pkg_lower]:-}
+  if [ -n "$constraint" ] && { [ "$HAVE_PACKAGING" != true ] || [ -z "$constraint_spec" ]; }; then
+    printf "${YELLOW}%-30s${RESET} %-12s %-12s %-12s ${YELLOW}SKIPPED (constrained: %s; cannot evaluate)${RESET}\n" "$name" "$curr" "$latest" "-" "$constraint"
     SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  # The requirements files that pin this package may end up on different
+  # versions (e.g. ternary on wrapt 1.x, everything else on 2.x). The
+  # environment is shared and can only hold one, so it is left unchanged;
+  # each file is still updated on its own by apply_file_updates.
+  versions_after=$(pkg_versions_after_update "$pkg_lower")
+  if [ "$(printf '%s' "$versions_after" | wc -w)" -gt 1 ]; then
+    printf "${YELLOW}%-30s${RESET} %-12s %-12s %-12s ${YELLOW}ENV UNCHANGED (files differ: %s)${RESET}\n" "$name" "$curr" "$latest" "-" "${versions_after% }"
+    ENV_LEFT=$((ENV_LEFT + 1))
     continue
   fi
 
@@ -498,7 +743,7 @@ while IFS= read -r row; do
   pypi_latest=""
   latest_date=""
   if [ "$HAVE_PACKAGING" = true ]; then
-    IFS=$'\t' read -r pypi_latest latest_date target target_date < <(find_installable_version "$name" "$curr" "$MIN_AGE_DAYS")
+    IFS=$'\t' read -r pypi_latest latest_date target target_date < <(find_installable_version "$name" "$curr" "$MIN_AGE_DAYS" "$constraint_spec")
   else
     pypi_latest="$latest"
     latest_date=$(curl -s "https://pypi.org/pypi/$name/$latest/json" | jq -r '.urls[0].upload_time_iso_8601[:10] // ""')
@@ -525,6 +770,13 @@ while IFS= read -r row; do
     continue
   fi
 
+  if [ -z "$target" ] && [ -n "$constraint" ]; then
+    # No newer release is both old enough and allowed by the constraints.
+    printf "${YELLOW}%-30s${RESET} %-12s %-12s %-12s ${YELLOW}SKIPPED (constrained: %s; no newer allowed release)${RESET}\n" "$name" "$curr" "$pypi_latest" "-" "$constraint"
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
   if [ -z "$target" ]; then
     # Every release newer than what's installed is still too new.
     if date -j > /dev/null 2>&1; then
@@ -547,37 +799,33 @@ while IFS= read -r row; do
   fi
 
   if [ $STATUS -eq 0 ]; then
-    if [ "$DRY_RUN" = false ]; then
-      # Patch every requirements file that pins this package. Whatever
-      # operator was used before (==, >=, <=, ~=, !=, >, <), the pin is
-      # normalized to == so every package stays pinned to an exact
-      # version. Files that don't reference the package are left
-      # untouched.
-      new_name=$(display_name "$name")
-      for f in "${REQUIREMENTS_FILES[@]}"; do
-        perl -i -pe "s/^(\\Q${name}\\E)(==|>=|<=|~=|!=|>|<)([^\\s#]*)(.*)\$/${new_name}==${target}\${4}/i" "$f"
-      done
-    fi
-    if [ "$target" = "$pypi_latest" ]; then
+    # Requirements files are patched separately, per file, by
+    # apply_file_updates (each file gets the newest version allowed for it).
+    if [ -n "$constraint" ]; then
+      printf "${GREEN}%-30s${RESET} %-12s ${GREEN}%-12s${RESET} %-12s ${GREEN}UPDATED (within %s; latest %s)${RESET}\n" "$name" "$curr" "$target" "$target_date" "$constraint" "$pypi_latest"
+    elif [ "$target" = "$pypi_latest" ]; then
       printf "${GREEN}%-30s${RESET} %-12s ${GREEN}%-12s${RESET} %-12s ${GREEN}UPDATED${RESET}\n" "$name" "$curr" "$target" "$target_date"
     else
       printf "${GREEN}%-30s${RESET} %-12s ${GREEN}%-12s${RESET} %-12s ${GREEN}UPDATED (latest %s too new)${RESET}\n" "$name" "$curr" "$target" "$target_date" "$pypi_latest"
     fi
     UPDATED=$((UPDATED + 1))
   else
+    ENV_FAILED[$pkg_lower]=1
     printf "%-30s %-12s %-12s %-12s FAILED\n" "$name" "$curr" "$target" "$target_date"
   fi
 
 done < <(echo "$OUTDATED" | jq -c '.[]')
 
 echo "-------------------------------------------------------------------------"
-echo "Updated: $UPDATED  Skipped (constrained): $SKIPPED  Too new: $TOO_NEW"
+echo "Updated: $UPDATED  Skipped (constrained): $SKIPPED  Too new: $TOO_NEW  Env unchanged (files differ): $ENV_LEFT"
+apply_file_updates
 echo ""
 
 echo ""
 echo "Unresolved constraints:"
 pip check
 
+echo ""
 echo "Writing requirements_installed.txt"
 mkdir -p postinstall
 pip freeze > postinstall/requirements_installed.txt
